@@ -2,49 +2,35 @@ import { NextRequest, NextResponse } from "next/server";
 import https from "https";
 import http from "http";
 
-// Create a custom agent to ignore SSL errors (reused if needed)
+export const dynamic = 'force-dynamic'; // Prevent static optimization
+
+// Custom agent to ignore SSL issues
 const agent = new https.Agent({
   rejectUnauthorized: false
 });
 
-// Helper to fetch using native modules (ignores SSL errors, follows redirects)
-function insecureFetch(url: string, headers: any, redirectCount = 5): Promise<{ buffer: Buffer; headers: any; status: number; statusText: string; url: string }> {
+// Helper: Fetch stream with redirect handling
+function fetchStream(url: string, headers: any, redirectCount = 5): Promise<{ res: http.IncomingMessage; url: string }> {
   return new Promise((resolve, reject) => {
-    if (redirectCount <= 0) {
-        return reject(new Error("Too many redirects"));
-    }
+    if (redirectCount <= 0) return reject(new Error("Too many redirects"));
 
     const isHttp = url.startsWith("http:");
     const requestModule = isHttp ? http : https;
     
-    // Parse URL to ensure options work for both modules
-    // http.request(url, options...) works in Node 10+
-    
     const options = {
         headers: headers,
+        agent: isHttp ? undefined : agent,
         rejectUnauthorized: false, 
         method: 'GET'
     };
 
     const req = requestModule.request(url, options, (res) => {
-        // Handle Redirects (301, 302, 303, 307, 308)
         if (res.statusCode && [301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
              const newUrl = new URL(res.headers.location, url).href;
-             res.resume(); // Consume/discard response data to free 'socket'
-             return resolve(insecureFetch(newUrl, headers, redirectCount - 1));
+             res.resume(); 
+             return resolve(fetchStream(newUrl, headers, redirectCount - 1));
         }
-
-        const chunks: any[] = [];
-        res.on('data', (d) => chunks.push(d));
-        res.on('end', () => {
-            resolve({
-                buffer: Buffer.concat(chunks),
-                headers: res.headers,
-                status: res.statusCode || 200,
-                statusText: res.statusMessage || "",
-                url: url // This is the final URL after redirects
-            });
-        });
+        resolve({ res, url });
     });
 
     req.on('error', (e) => reject(e));
@@ -52,9 +38,31 @@ function insecureFetch(url: string, headers: any, redirectCount = 5): Promise<{ 
   });
 }
 
+// Helper: Consume stream to buffer (for rewriting text)
+function streamToBuffer(stream: http.IncomingMessage): Promise<Buffer> {
+    return new Promise((resolve, reject) => {
+        const chunks: any[] = [];
+        stream.on('data', (c) => chunks.push(c));
+        stream.on('end', () => resolve(Buffer.concat(chunks)));
+        stream.on('error', reject);
+    });
+}
+
+// Helper: Convert Node stream to Web ReadableStream (for streaming response)
+function nodeToWebStream(nodeStream: http.IncomingMessage): ReadableStream {
+    return new ReadableStream({
+        start(controller) {
+            nodeStream.on('data', (chunk) => controller.enqueue(chunk));
+            nodeStream.on('end', () => controller.close());
+            nodeStream.on('error', (err) => controller.error(err));
+        }
+    });
+}
+
 export async function GET(req: NextRequest) {
   const urlParams = req.nextUrl.searchParams;
   const url = urlParams.get("url");
+  const refererParam = urlParams.get("referer");
 
   if (!url) {
     return new NextResponse("Missing URL parameter", { status: 400 });
@@ -65,112 +73,136 @@ export async function GET(req: NextRequest) {
     const headers: any = {
       "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
       "Accept": "*/*",
-      "Referer": new URL(url).origin + "/", 
-      "Origin": new URL(url).origin,
+      "Referer": refererParam || new URL(url).origin + "/", 
+      // NOTE: Do NOT send Origin header - video CDN returns 403 if Origin doesn't match their whitelist
     };
 
     if (range) {
       headers["Range"] = range;
     }
 
-    // Use native request helper
-    const response = await insecureFetch(url, headers);
+    // 1. Start Request (Get Stream)
+    const { res: upstreamRes, url: finalUrl } = await fetchStream(url, headers);
 
-    if (response.status >= 400) {
-       console.error(`Proxy fetch failed for ${url}: ${response.status} ${response.statusText}`);
-       return new NextResponse(`Upstream Error: ${response.statusText}`, { status: response.status });
+    if ((upstreamRes.statusCode || 500) >= 400) {
+       console.error(`Proxy fetch failed for ${url}: ${upstreamRes.statusCode}`);
+       return new NextResponse(`Upstream Error: ${upstreamRes.statusMessage}`, { status: upstreamRes.statusCode });
     }
 
-    const buffer = response.buffer;
-    const decoder = new TextDecoder();
+    const contentType = (upstreamRes.headers['content-type'] || "").toLowerCase();
+    const lowUrl = finalUrl.toLowerCase();
     
-    // Safety check small buffer
-    const firstChunk = decoder.decode(buffer.slice(0, 100)); 
-    const looksLikeLiveStream = firstChunk.includes("#EXTM3U");
-    const looksLikeVtt = firstChunk.includes("WEBVTT");
-
-    const contentType = (response.headers['content-type'] || "").toLowerCase();
-    const lowUrl = url.toLowerCase();
-    const isM3u8 = looksLikeLiveStream || 
-                   contentType.includes("application/vnd.apple.mpegurl") || 
+    // 2. Identify Type
+    const isM3u8 = contentType.includes("application/vnd.apple.mpegurl") || 
                    contentType.includes("application/x-mpegurl") ||
                    lowUrl.includes(".m3u8");
+                   
+    const isVtt = contentType.includes("text/vtt") || lowUrl.endsWith(".vtt") || lowUrl.endsWith(".srt");
 
-    if (isM3u8) {
-      const text = decoder.decode(buffer);
-      const baseUrl = new URL(response.url); // Use final URL
-    // Determine valid origin from request headers (critical for VPS/Reverse Proxy)
+    // 3. IF BINARY (MP4, TS, etc) -> STREAM DIRECTLY
+    if (!isM3u8 && !isVtt && (lowUrl.includes(".mp4") || lowUrl.includes(".ts") || contentType.includes("video/"))) {
+        const stream = nodeToWebStream(upstreamRes);
+        
+        const responseHeaders = new Headers();
+        responseHeaders.set("Content-Type", contentType || "video/mp4");
+        responseHeaders.set("Access-Control-Allow-Origin", "*");
+        responseHeaders.set("Accept-Ranges", "bytes");
+        
+        if (upstreamRes.headers['content-length']) {
+            responseHeaders.set("Content-Length", upstreamRes.headers['content-length']);
+        }
+        if (upstreamRes.headers['content-range']) {
+            responseHeaders.set("Content-Range", upstreamRes.headers['content-range']);
+        }
+
+        return new NextResponse(stream as any, {
+            status: upstreamRes.statusCode || 200,
+            statusText: upstreamRes.statusMessage,
+            headers: responseHeaders
+        });
+    }
+
+    // 4. IF TEXT/HLS -> BUFFER & REWRITE
+    const buffer = await streamToBuffer(upstreamRes);
+    const decoder = new TextDecoder();
+    
+    // Double check content (sometimes headers lie)
+    const firstChunk = decoder.decode(buffer.slice(0, 100)); 
+    const isM3u8Content = firstChunk.includes("#EXTM3U");
+    
+    // DETERMINE VALID ORIGIN for rewrites
     const host = req.headers.get("x-forwarded-host") || req.headers.get("host");
     const proto = req.headers.get("x-forwarded-proto") || "https"; 
     const origin = `${proto}://${host}`;
 
-      const subUrl = urlParams.get("sub");
-      const isMasterPlaylist = text.includes("#EXT-X-STREAM-INF");
+    if (isM3u8 || isM3u8Content) {
+        const text = decoder.decode(buffer);
+        const baseUrl = new URL(finalUrl); 
 
-      let rewritten = text.split(/\r?\n/).map(line => {
-        const trimmed = line.trim();
-        if (!trimmed) return line;
+        const subUrl = urlParams.get("sub");
+        const isMasterPlaylist = text.includes("#EXT-X-STREAM-INF");
 
-        if (trimmed.startsWith('#')) {
-            return line.replace(/URI="([^"]+)"/g, (match, uri) => {
-                 try {
-                     const absoluteUrl = new URL(uri, baseUrl.href).href;
-                     return `URI="${origin}/api/proxy/video?url=${encodeURIComponent(absoluteUrl)}"`;
-                 } catch (e) {
-                     return match;
-                 }
+        let rewritten = text.split(/\r?\n/).map(line => {
+            const trimmed = line.trim();
+            if (!trimmed) return line;
+
+            const createProxyUrl = (targetUrl: string) => {
+                let base = `${origin}/api/proxy/video?url=${encodeURIComponent(targetUrl)}`;
+                if (refererParam) base += `&referer=${encodeURIComponent(refererParam)}`;
+                return base;
+            };
+
+            if (trimmed.startsWith('#')) {
+                return line.replace(/URI="([^"]+)"/g, (match, uri) => {
+                    try {
+                        const absoluteUrl = new URL(uri, baseUrl.href).href;
+                        return `URI="${createProxyUrl(absoluteUrl)}"`;
+                    } catch (e) { return match; }
+                });
+            }
+            
+            try {
+                const absoluteUrl = new URL(trimmed, baseUrl.href).href;
+                return createProxyUrl(absoluteUrl);
+            } catch (e) { return line; }
+        }).join('\n');
+
+        if (isMasterPlaylist && subUrl) {
+            let proxiedSubUrl = `${origin}/api/proxy/video?url=${encodeURIComponent(subUrl)}`;
+            if (refererParam) proxiedSubUrl += `&referer=${encodeURIComponent(refererParam)}`;
+            
+            const mediaLine = `#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="Indonesia",DEFAULT=YES,AUTOSELECT=YES,LANGUAGE="id",URI="${proxiedSubUrl}"`;
+            rewritten = rewritten.replace("#EXTM3U", "#EXTM3U\n" + mediaLine);
+            rewritten = rewritten.replace(/#EXT-X-STREAM-INF:(.*)/g, (match, attrs) => {
+                if (attrs.includes("SUBTITLES=")) return match; 
+                return `#EXT-X-STREAM-INF:${attrs},SUBTITLES="subs"`;
             });
         }
-        
-        try {
-          const absoluteUrl = new URL(trimmed, baseUrl.href).href;
-          return `${origin}/api/proxy/video?url=${encodeURIComponent(absoluteUrl)}`;
-        } catch (e) {
-          return line;
-        }
-      }).join('\n');
 
-      if (isMasterPlaylist && subUrl) {
-          const proxiedSubUrl = `${origin}/api/proxy/video?url=${encodeURIComponent(subUrl)}`;
-          const mediaLine = `#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="Indonesia",DEFAULT=YES,AUTOSELECT=YES,LANGUAGE="id",URI="${proxiedSubUrl}"`;
-          rewritten = rewritten.replace("#EXTM3U", "#EXTM3U\n" + mediaLine);
-          rewritten = rewritten.replace(/#EXT-X-STREAM-INF:(.*)/g, (match, attrs) => {
-               if (attrs.includes("SUBTITLES=")) return match; 
-               return `#EXT-X-STREAM-INF:${attrs},SUBTITLES="subs"`;
-          });
-      }
-
-      return new NextResponse(rewritten, {
-        status: 200,
-        headers: {
-          "Content-Type": "application/vnd.apple.mpegurl",
-          "Access-Control-Allow-Origin": "*",
-          "Cache-Control": "no-store",
-        }
-      });
+        return new NextResponse(rewritten, {
+            status: 200,
+            headers: {
+                "Content-Type": "application/vnd.apple.mpegurl",
+                "Access-Control-Allow-Origin": "*",
+                "Cache-Control": "no-store",
+            }
+        });
     }
 
-    // VTT / SRT Logic
-    const isSrt = lowUrl.includes(".srt");
-
-    if (looksLikeVtt || isSrt) {
+    // VTT/SRT Logic
+    if (isVtt || lowUrl.endsWith(".srt")) {
        let vttContent = decoder.decode(buffer);
+       const isSrt = lowUrl.includes(".srt");
        
-       if (isSrt && !looksLikeVtt) {
-           vttContent = vttContent.replace(/\r\n/g, '\n');
-           vttContent = vttContent.replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, '$1.$2');
-           if (!vttContent.trim().startsWith("WEBVTT")) {
-               vttContent = "WEBVTT\n\n" + vttContent;
-           }
+       if (isSrt && !firstChunk.includes("WEBVTT")) {
+           vttContent = vttContent.replace(/\r\n/g, '\n')
+                        .replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, '$1.$2');
+           vttContent = "WEBVTT\n\n" + vttContent;
        }
        
-       // Force subtitle position via VTT line setting (line:70% for fit)
        vttContent = vttContent.replace(
            /((?:\d{2}:)?\d{2}:\d{2}\.\d{3} --> (?:\d{2}:)?\d{2}:\d{2}\.\d{3})(.*)/g, 
-           (match, time, rest) => {
-               if (rest.includes("line:")) return match; 
-               return `${time} line:75%${rest}`;
-           }
+           (match, time, rest) => rest.includes("line:") ? match : `${time} line:75%${rest}`
        );
 
        return new NextResponse(vttContent, {
@@ -183,16 +215,12 @@ export async function GET(req: NextRequest) {
        });
     }
 
-    // Binary / Segment content
+    // FALLBACK: Just return buffered content (e.g. small unknown files)
     return new NextResponse(buffer as any, {
-        status: response.status,
-        statusText: response.statusText,
+        status: upstreamRes.statusCode || 200,
         headers: {
-            // @ts-ignore
-            "Content-Type": contentType || "video/mp4",
+            "Content-Type": contentType,
             "Access-Control-Allow-Origin": "*",
-            "Accept-Ranges": "bytes",
-            "Content-Length": String(buffer.byteLength),
         }
     });
 

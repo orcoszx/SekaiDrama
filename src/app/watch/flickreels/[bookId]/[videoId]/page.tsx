@@ -17,15 +17,17 @@ export default function FlickReelsWatchPage() {
   const [activeVideoId, setActiveVideoId] = useState(initialVideoId);
   const [showEpisodeList, setShowEpisodeList] = useState(false);
   const [useProxy, setUseProxy] = useState(false);
+  const [retryCount, setRetryCount] = useState(0);
   const videoRef = useRef<HTMLVideoElement | null>(null);
 
-  const { data, isLoading, error } = useFlickReelsDetail(bookId);
+  const { data, isLoading, error, refetch } = useFlickReelsDetail(bookId);
 
   // Sync state if URL param changes (e.g. back button)
   useEffect(() => {
     if (params.videoId && params.videoId !== activeVideoId) {
       setActiveVideoId(params.videoId as string);
       setUseProxy(false);
+      setRetryCount(0);
     }
   }, [params.videoId]);
 
@@ -128,17 +130,23 @@ export default function FlickReelsWatchPage() {
             {currentEpisodeData ? (
               <video
                 ref={videoRef}
-                src={useProxy ? `/api/proxy/video?url=${encodeURIComponent(currentEpisodeData.raw.videoUrl)}` : currentEpisodeData.raw.videoUrl}
+                src={useProxy ? `/api/proxy/video?url=${encodeURIComponent(currentEpisodeData.raw.videoUrl)}&referer=${encodeURIComponent("https://www.flickreels.com/")}` : currentEpisodeData.raw.videoUrl}
                 controls
                 autoPlay
                 className="w-full h-full object-contain max-h-[100dvh]"
                 poster={currentEpisodeData.raw.chapter_cover}
                 onEnded={handleVideoEnded}
-                onError={(e) => {
-                    // Prevent infinite loop if proxy also fails
+                onError={async (e) => {
                     if (!useProxy) {
+                        // First try: switch to proxy
                         console.log("Video load failed, switching to proxy...");
                         setUseProxy(true);
+                    } else if (retryCount < 2) {
+                        // Proxy also failed - token probably expired, refetch fresh URLs
+                        console.log("Proxy also failed, refetching fresh data...");
+                        setRetryCount(prev => prev + 1);
+                        setUseProxy(false);
+                        await refetch();
                     }
                 }}
                 // @ts-ignore
