@@ -1,17 +1,18 @@
-# SekaiDrama 🎬
+# SekaiDrama
 
 [![License](https://img.shields.io/github/license/Sansekai/SekaiDrama)](https://github.com/Sansekai/SekaiDrama/blob/main/LICENSE)
 [![Repository](https://img.shields.io/badge/GitHub-Repository-blue?logo=github)](https://github.com/Sansekai/SekaiDrama)
 
+![Preview](public/preview.png)
 
 SekaiDrama adalah platform streaming drama pendek (vertical drama) modern yang menampilkan konten dari bebebrapa platform populer. Dibangun dengan teknologi web terkini untuk performa maksimal dan pengalaman pengguna yang premium.
 
-## 🛠️ Persyaratan Sistem
+## Persyaratan Sistem
 Sebelum memulai, pastikan komputer Anda sudah terinstall:
 - [Node.js](https://nodejs.org/) (Versi 18 LTS atau 20 LTS disarankan)
 - Git (Opsional)
 
-## 📦 Panduan Instalasi (Localhost)
+## Panduan Instalasi (Localhost)
 
 Ikuti langkah-langkah berikut untuk menjalankan project ini di komputer Anda:
 
@@ -47,7 +48,7 @@ npm run dev
 
 Buka browser dan kunjungi [http://localhost:3000](http://localhost:3000).
 
-## 🔧 Script Perintah
+## Script Perintah
 | Command | Fungsi |
 |---------|--------|
 | `npm run dev` | Menjalankan server development |
@@ -55,7 +56,7 @@ Buka browser dan kunjungi [http://localhost:3000](http://localhost:3000).
 | `npm run start` | Menjalankan build production |
 | `npm run lint` | Cek error coding style (Linting) |
 
-## 📁 Struktur Folder
+## Struktur Folder
 ```text
 src/
 ├── app/                    # Halaman & Routing (Next.js App Router)
